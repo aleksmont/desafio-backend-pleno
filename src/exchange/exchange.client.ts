@@ -22,18 +22,13 @@ export class ExchangeClient {
   ) {}
 
   async enrich(input: OrderInput, target: string): Promise<Enrichment> {
-    if (input.currency === target) {
-      return {
-        source: 'identity',
-        currency: target,
-        rate: 1,
-        rate_date: new Date(this.clock.now()).toISOString().slice(0, 10),
-        converted_total: convertTotal(input, 1),
-      };
-    }
+    const sameCurrency = input.currency === target;
+    // Frankfurter omits the base from its rates. Validate it against another currency
+    // even for identity conversions, so every order depends on external enrichment.
+    const quotedCurrency = sameCurrency ? (input.currency === 'USD' ? 'EUR' : 'USD') : target;
     const url = new URL(this.config.api);
     url.searchParams.set('base', input.currency);
-    url.searchParams.set('symbols', target);
+    url.searchParams.set('symbols', quotedCurrency);
     const signal = AbortSignal.timeout(this.config.timeout);
     try {
       const response = await this.httpFetch(url, {
@@ -43,18 +38,20 @@ export class ExchangeClient {
       });
       if (!response.ok) {
         await response.body?.cancel();
-        const retryable = [408, 429].includes(response.status) || response.status >= 500;
         throw new ExchangeError(
           `EXCHANGE_HTTP_${response.status}`,
-          retryable,
           this.retryAfter(response.headers.get('retry-after')),
         );
       }
       const parsed = rateResponse.safeParse(await this.readJson(response));
-      if (!parsed.success || parsed.data.base !== input.currency || !parsed.data.rates[target]) {
-        throw new ExchangeError('EXCHANGE_INVALID_RESPONSE', true);
+      if (
+        !parsed.success ||
+        parsed.data.base !== input.currency ||
+        !parsed.data.rates[quotedCurrency]
+      ) {
+        throw new ExchangeError('EXCHANGE_INVALID_RESPONSE');
       }
-      const rate = parsed.data.rates[target];
+      const rate = sameCurrency ? 1 : parsed.data.rates[quotedCurrency];
       return {
         source: 'frankfurter',
         currency: target,
@@ -64,9 +61,9 @@ export class ExchangeClient {
       };
     } catch (error) {
       if (error instanceof ExchangeError) throw error;
-      if (signal.aborted) throw new ExchangeError('EXCHANGE_TIMEOUT', true);
-      if (error instanceof RangeError) throw new ExchangeError('AMOUNT_OUT_OF_RANGE', false);
-      throw new ExchangeError('EXCHANGE_NETWORK_ERROR', true);
+      if (signal.aborted) throw new ExchangeError('EXCHANGE_TIMEOUT');
+      if (error instanceof RangeError) throw new ExchangeError('AMOUNT_OUT_OF_RANGE');
+      throw new ExchangeError('EXCHANGE_NETWORK_ERROR');
     }
   }
 
@@ -78,7 +75,7 @@ export class ExchangeClient {
 
   private async readJson(response: Response): Promise<unknown> {
     const reader = response.body?.getReader();
-    if (!reader) throw new ExchangeError('EXCHANGE_INVALID_RESPONSE', true);
+    if (!reader) throw new ExchangeError('EXCHANGE_INVALID_RESPONSE');
     let bytes = 0;
     const chunks: Uint8Array[] = [];
     try {
@@ -88,7 +85,7 @@ export class ExchangeClient {
         bytes += chunk.value.byteLength;
         if (bytes > MAX_RESPONSE_BYTES) {
           await reader.cancel();
-          throw new ExchangeError('EXCHANGE_RESPONSE_TOO_LARGE', false);
+          throw new ExchangeError('EXCHANGE_RESPONSE_TOO_LARGE');
         }
         chunks.push(chunk.value);
       }
@@ -98,7 +95,7 @@ export class ExchangeClient {
     try {
       return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
     } catch {
-      throw new ExchangeError('EXCHANGE_INVALID_RESPONSE', true);
+      throw new ExchangeError('EXCHANGE_INVALID_RESPONSE');
     }
   }
 }

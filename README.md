@@ -52,6 +52,8 @@ A configuração é validada na inicialização, sem leitura de ambiente durante
 
 ## Garantias da fila
 
+A escolha de SQLite é deliberada: o [enunciado original da Buzzmates](https://github.com/buzzmates/desafio-backend-pleno) exige fila, backoff e DLQ, mas não determina um broker. Aqui, WAITING/RETRY representam os jobs disponíveis, ACTIVE representa a posse temporária pelo worker e DLQ é a fila lógica persistente de jobs que esgotaram as tentativas. Não se trata apenas de um status informativo: o worker consulta, adquire e processa esses registros de forma assíncrona, e deixa de consumir os jobs na DLQ. Os testes verificam esse ciclo, a concorrência e a recuperação após interrupção. Essa escolha reduz os serviços necessários para avaliar o desafio; seus limites operacionais estão descritos ao final.
+
 SQLite em modo WAL persiste o pedido e seu job na mesma linha, dentro de uma transação. Isso evita uma janela entre gravar o pedido e publicar a mensagem. Cada processo executa um job por vez; processos independentes no mesmo banco disputam jobs com transações `BEGIN IMMEDIATE` e atualização atômica.
 
 ```text
@@ -68,9 +70,9 @@ A semântica é **at-least-once**: uma queda após a consulta externa pode causa
 
 ## Integração e valores
 
-O cliente usa a [API Frankfurter v1](https://frankfurter.dev/) para obter a taxa de câmbio. Valida moeda-base, data e taxa positiva. O timeout cobre cabeçalhos e corpo; respostas são limitadas a 64 KiB e redirects não são seguidos. Conversão para a própria moeda usa taxa 1 sem HTTP.
+O cliente usa a [API Frankfurter v1](https://frankfurter.dev/) para obter a taxa de câmbio. Valida moeda-base, data e taxa positiva. O timeout cobre cabeçalhos e corpo; respostas são limitadas a 64 KiB e redirects não são seguidos. Todos os pedidos consultam o serviço externo, inclusive quando a moeda de origem é igual à de destino. Nesse caso, uma cotação de referência confirma a moeda e a data no provedor; o total permanece inalterado com taxa 1. Se essa consulta falhar, o pedido segue o mesmo fluxo de retry.
 
-Timeouts, erros de rede, 408, 429, 5xx e respostas inválidas admitem retry. Outros 4xx, resposta excessiva e valores monetários fora da faixa suportada vão diretamente à DLQ. O backoff é exponencial, com jitter de ±20%, respeita `Retry-After` e tem teto de 60 segundos. O padrão é de três tentativas totais. Liste a DLQ com `GET /orders?status=FAILED_ENRICHMENT`; não há reenvio automático nem endpoint de reprocessamento.
+Toda falha de enriquecimento, incluindo erros HTTP 4xx, timeouts, respostas inválidas, respostas excessivas e valores fora da faixa suportada, passa pelo orçamento configurado de tentativas. Apenas após esgotá-lo o job vai para a DLQ com status `FAILED_ENRICHMENT`. Essa política segue literalmente o enunciado, mesmo quando repetir um erro provavelmente não terá sucesso. O backoff é exponencial, com jitter de ±20%, respeita `Retry-After` e tem teto de 60 segundos. O padrão é de três tentativas totais. Liste a DLQ com `GET /orders?status=FAILED_ENRICHMENT`; não há reenvio automático nem endpoint de reprocessamento.
 
 Valores de origem são somados em centavos. A multiplicação pela taxa usa `decimal.js`, com arredondamento half-up para duas casas decimais e verificação de inteiro seguro. O contrato deste desafio adota duas casas para todas as moedas; não implementa regras de casas decimais específicas por moeda ou contabilidade financeira.
 

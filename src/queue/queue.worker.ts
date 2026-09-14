@@ -56,13 +56,10 @@ export class QueueWorker implements OnModuleInit, OnModuleDestroy {
       enrichment = await this.exchange.enrich(job.input, job.targetCurrency);
     } catch (error) {
       const failure =
-        error instanceof ExchangeError
-          ? error
-          : new ExchangeError('ENRICHMENT_INTERNAL_ERROR', true);
+        error instanceof ExchangeError ? error : new ExchangeError('ENRICHMENT_INTERNAL_ERROR');
       const accepted = this.orders.fail(
         job,
         failure.code,
-        failure.retryable,
         this.retry.delay(job.attempts, failure.retryAfterMs),
       );
       this.logger.warn({

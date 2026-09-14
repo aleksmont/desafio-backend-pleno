@@ -173,9 +173,9 @@ export class OrdersRepository {
     return result.changes === 1;
   }
 
-  fail(job: ClaimedOrder, code: string, retryable: boolean, delayMs: number): boolean {
+  fail(job: ClaimedOrder, code: string, delayMs: number): boolean {
     const now = this.clock.now();
-    const terminal = !retryable || job.attempts >= job.maxAttempts;
+    const terminal = job.attempts >= job.maxAttempts;
     const result = this.db
       .prepare(
         `UPDATE orders SET status=?, job_state=?, available_at=?,

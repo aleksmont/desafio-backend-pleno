@@ -70,7 +70,7 @@ test('jobs are leased exclusively and completed only by the current owner', (t) 
   assert.equal(repository.complete({ ...job, leaseToken: 'wrong-token' }, enrichment), false);
   assert.equal(repository.complete(job, enrichment), true);
   assert.equal(repository.complete(job, enrichment), false);
-  assert.equal(repository.fail(job, 'late-error', true, 1000), false);
+  assert.equal(repository.fail(job, 'late-error', 1000), false);
   assert.deepEqual(repository.find(job.id).enrichment, enrichment);
 });
 
@@ -78,26 +78,27 @@ test('transient failure respects due time and eventually reaches DLQ', (t) => {
   const { repository, clock } = setup(t, { attempts: 2 });
   const { order } = repository.receive(payload());
   let job = repository.claim();
-  assert.equal(repository.fail(job, 'EXCHANGE_TIMEOUT', true, 1000), true);
+  assert.equal(repository.fail(job, 'EXCHANGE_TIMEOUT', 1000), true);
   assert.equal(repository.metrics().counts.RETRY, 1);
   clock.advance(999);
   assert.equal(repository.claim(), undefined);
   clock.advance(1);
   job = repository.claim();
   assert.equal(job.attempts, 2);
-  repository.fail(job, 'EXCHANGE_TIMEOUT', true, 1000);
+  repository.fail(job, 'EXCHANGE_TIMEOUT', 1000);
   assert.equal(repository.find(order.id).status, 'FAILED_ENRICHMENT');
   assert.equal(repository.metrics().counts.DLQ, 1);
   clock.advance(10000);
   assert.equal(repository.claim(), undefined);
 });
 
-test('permanent failure goes directly to DLQ', (t) => {
+test('HTTP 422 remains queued until its attempt budget is exhausted', (t) => {
   const { repository } = setup(t);
   repository.receive(payload());
   const job = repository.claim();
-  repository.fail(job, 'EXCHANGE_HTTP_422', false, 0);
-  assert.equal(repository.find(job.id).queueState, 'DLQ');
+  repository.fail(job, 'EXCHANGE_HTTP_422', 0);
+  assert.equal(repository.find(job.id).queueState, 'RETRY');
+  assert.equal(repository.find(job.id).status, 'RECEIVED');
   assert.equal(repository.find(job.id).attempts, 1);
 });
 
@@ -107,7 +108,7 @@ test('expired leases reject late writes before and after reassignment', (t) => {
   const old = repository.claim();
   clock.advance(config.leaseMs);
   assert.equal(repository.complete(old, enrichment), false);
-  assert.equal(repository.fail(old, 'late', true, 0), false);
+  assert.equal(repository.fail(old, 'late', 0), false);
   assert.equal(repository.claim(), undefined);
   assert.equal(repository.find(old.id).lastError, 'WORKER_LEASE_EXPIRED');
   clock.advance(config.backoff);

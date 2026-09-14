@@ -45,7 +45,7 @@ test('worker retries transient errors then succeeds and clears the last error', 
   let calls = 0;
   const queue = worker(ctx, {
     enrich: async () => {
-      if (++calls === 1) throw new ExchangeError('EXCHANGE_TIMEOUT', true, 5000);
+      if (++calls === 1) throw new ExchangeError('EXCHANGE_TIMEOUT', 5000);
       return enrichment;
     },
   });
@@ -64,7 +64,7 @@ test('worker exhausts the attempt budget and stops processing the DLQ', async (t
   const { order } = ctx.repository.receive(payload());
   const queue = worker(ctx, {
     enrich: async () => {
-      throw new ExchangeError('EXCHANGE_HTTP_503', true);
+      throw new ExchangeError('EXCHANGE_HTTP_503');
     },
   });
   await queue.processNext();
@@ -119,7 +119,7 @@ for (const fail of [false, true]) {
     const queue = worker(ctx, {
       enrich: async () => {
         ctx.clock.advance(ctx.config.leaseMs);
-        if (fail) throw new ExchangeError('TIMEOUT', true);
+        if (fail) throw new ExchangeError('TIMEOUT');
         return enrichment;
       },
     });
@@ -181,4 +181,75 @@ test('persistence failure preserves the lease and does not block shutdown', asyn
   await Promise.all([processing, stopping]);
   assert.equal(ctx.repository.find(order.id).queueState, 'ACTIVE');
   assert.equal(ctx.repository.find(order.id).lastError, null);
+});
+
+const { ExchangeClient } = require('../dist/exchange/exchange.client');
+const { rateBody } = require('./helpers.cjs');
+for (const [name, response, code] of [
+  ['HTTP 422', () => new Response(null, { status: 422 }), 'EXCHANGE_HTTP_422'],
+  ['oversized body', () => new Response('x'.repeat(65537)), 'EXCHANGE_RESPONSE_TOO_LARGE'],
+  [
+    'unsafe amount',
+    () => Response.json({ ...rateBody, rates: { BRL: 1e20 } }),
+    'AMOUNT_OUT_OF_RANGE',
+  ],
+  ['invalid payload', () => Response.json({}), 'EXCHANGE_INVALID_RESPONSE'],
+]) {
+  test(`${name} retries with backoff before moving to DLQ`, async (t) => {
+    const ctx = setup(t);
+    const { order } = ctx.repository.receive(payload());
+    let calls = 0;
+    const client = new ExchangeClient(
+      ctx.config,
+      async () => {
+        calls++;
+        return response();
+      },
+      ctx.clock,
+    );
+    const queue = worker(ctx, client);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      assert.equal(await queue.processNext(), true);
+      const current = ctx.repository.find(order.id);
+      assert.equal(current.attempts, attempt);
+      assert.equal(current.lastError, code);
+      assert.equal(current.queueState, attempt === 3 ? 'DLQ' : 'RETRY');
+      assert.equal(current.status, attempt === 3 ? 'FAILED_ENRICHMENT' : 'RECEIVED');
+      if (attempt < 3) {
+        ctx.clock.advance(1000 * 2 ** (attempt - 1) - 1);
+        assert.equal(await queue.processNext(), false);
+        assert.equal(calls, attempt);
+        ctx.clock.advance(1);
+      }
+    }
+    ctx.clock.advance(10000);
+    assert.equal(await queue.processNext(), false);
+    assert.equal(calls, 3);
+  });
+}
+
+test('same-currency provider failure is retried before completing with external metadata', async (t) => {
+  const ctx = setup(t);
+  const { order } = ctx.repository.receive(payload('same', 'BRL'));
+  let calls = 0;
+  const client = new ExchangeClient(
+    ctx.config,
+    async () => {
+      if (++calls === 1) return new Response(null, { status: 503 });
+      return Response.json({ base: 'BRL', rates: { USD: 0.2 }, date: '2026-09-11' });
+    },
+    ctx.clock,
+  );
+  const queue = worker(ctx, client);
+  await queue.processNext();
+  assert.equal(ctx.repository.find(order.id).queueState, 'RETRY');
+  ctx.clock.advance(1000);
+  await queue.processNext();
+  const completed = ctx.repository.find(order.id);
+  assert.equal(completed.status, 'COMPLETED');
+  assert.equal(completed.attempts, 2);
+  assert.equal(completed.enrichment.source, 'frankfurter');
+  assert.equal(completed.enrichment.rate_date, '2026-09-11');
+  assert.equal(completed.enrichment.converted_total, 119.8);
+  assert.equal(calls, 2);
 });

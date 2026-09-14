@@ -7,8 +7,7 @@ const { payload, rateBody } = require('./helpers.cjs');
 const clock = { now: () => Date.parse('2026-09-14T12:00:00Z') };
 const client = (httpFetch, overrides = {}) =>
   new ExchangeClient({ ...loadConfig({}), ...overrides }, httpFetch, clock);
-const matches = (code, retryable) => (error) =>
-  error.code === code && error.retryable === retryable;
+const matches = (code) => (error) => error.code === code;
 
 test('exchange requests the configured currencies and converts the total', async () => {
   const service = client(async (url, options) => {
@@ -25,14 +24,42 @@ test('exchange requests the configured currencies and converts the total', async
   assert.equal(result.rate_date, '2026-09-14');
 });
 
-test('identity conversion does not call the provider', async () => {
-  const service = client(() => {
-    throw new Error('unexpected HTTP call');
+for (const [currency, quote] of [
+  ['BRL', 'USD'],
+  ['USD', 'EUR'],
+]) {
+  test(`same-currency ${currency} conversion validates the provider before succeeding`, async () => {
+    let calls = 0;
+    const service = client(async (url) => {
+      calls++;
+      assert.equal(url.searchParams.get('base'), currency);
+      assert.equal(url.searchParams.get('symbols'), quote);
+      return Response.json({ base: currency, rates: { [quote]: 0.2 }, date: '2026-09-11' });
+    });
+    const result = await service.enrich(payload('same', currency), currency);
+    assert.equal(calls, 1);
+    assert.equal(result.converted_total, 119.8);
+    assert.equal(result.source, 'frankfurter');
+    assert.equal(result.rate_date, '2026-09-11');
+    assert.equal(result.rate, 1);
   });
-  const result = await service.enrich(payload('same', 'BRL'), 'BRL');
-  assert.equal(result.converted_total, 119.8);
-  assert.equal(result.source, 'identity');
-  assert.equal(result.rate, 1);
+}
+
+test('same-currency conversion cannot bypass an unavailable provider', async () => {
+  await assert.rejects(
+    client(async () => new Response(null, { status: 503 })).enrich(payload('same', 'BRL'), 'BRL'),
+    matches('EXCHANGE_HTTP_503'),
+  );
+});
+
+test('same-currency conversion rejects a missing reference rate', async () => {
+  await assert.rejects(
+    client(async () => Response.json({ base: 'BRL', rates: {}, date: '2026-09-14' })).enrich(
+      payload('same', 'BRL'),
+      'BRL',
+    ),
+    matches('EXCHANGE_INVALID_RESPONSE'),
+  );
 });
 
 for (const status of [400, 401, 404, 422, 408, 429, 500, 503]) {
@@ -42,7 +69,7 @@ for (const status of [400, 401, 404, 422, 408, 429, 500, 503]) {
         payload(),
         'BRL',
       ),
-      matches(`EXCHANGE_HTTP_${status}`, [408, 429].includes(status) || status >= 500),
+      matches(`EXCHANGE_HTTP_${status}`),
     );
   });
 }
@@ -59,7 +86,7 @@ for (const [name, body] of [
   test(`rejects ${name} in external response`, async () => {
     await assert.rejects(
       client(async () => Response.json(body)).enrich(payload(), 'BRL'),
-      matches('EXCHANGE_INVALID_RESPONSE', true),
+      matches('EXCHANGE_INVALID_RESPONSE'),
     );
   });
 }
@@ -68,7 +95,7 @@ test('malformed JSON and empty responses are retried', async () => {
   for (const response of [new Response('{broken'), new Response(null)]) {
     await assert.rejects(
       client(async () => response).enrich(payload(), 'BRL'),
-      matches('EXCHANGE_INVALID_RESPONSE', true),
+      matches('EXCHANGE_INVALID_RESPONSE'),
     );
   }
 });
@@ -76,7 +103,7 @@ test('malformed JSON and empty responses are retried', async () => {
 test('large response streams are cancelled before parsing', async () => {
   await assert.rejects(
     client(async () => new Response('x'.repeat(65537))).enrich(payload(), 'BRL'),
-    matches('EXCHANGE_RESPONSE_TOO_LARGE', false),
+    matches('EXCHANGE_RESPONSE_TOO_LARGE'),
   );
 });
 
@@ -85,17 +112,17 @@ test('network errors are sanitized and retryable', async () => {
     client(async () => {
       throw new Error('private secret URL');
     }).enrich(payload(), 'BRL'),
-    matches('EXCHANGE_NETWORK_ERROR', true),
+    matches('EXCHANGE_NETWORK_ERROR'),
   );
 });
 
-test('unsafe converted amounts fail permanently', async () => {
+test('unsafe converted amounts produce a stable error code', async () => {
   await assert.rejects(
     client(async () => Response.json({ ...rateBody, rates: { BRL: 1e20 } })).enrich(
       payload(),
       'BRL',
     ),
-    matches('AMOUNT_OUT_OF_RANGE', false),
+    matches('AMOUNT_OUT_OF_RANGE'),
   );
 });
 
@@ -130,5 +157,5 @@ test('real HTTP timeout includes a stalled response body', async (t) => {
     api: `http://127.0.0.1:${server.address().port}/rates`,
     timeout: 50,
   });
-  await assert.rejects(service.enrich(payload(), 'BRL'), matches('EXCHANGE_TIMEOUT', true));
+  await assert.rejects(service.enrich(payload(), 'BRL'), matches('EXCHANGE_TIMEOUT'));
 });
