@@ -1,72 +1,110 @@
-const {test} = require('node:test');
+const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const {createServer} = require('node:http');
-const {mkdtempSync, rmSync} = require('node:fs');
-const {tmpdir} = require('node:os');
-const {join} = require('node:path');
-test('HTTP validation, durable queue, idempotency, retries, DLQ and restart', async () => {
-  const dir = mkdtempSync(join(tmpdir(),'orders-test-'));
-  let calls = 0;
-  const external = createServer((req,res) => {
-    calls++;
-    const base = new URL(req.url,'http://localhost').searchParams.get('base');
-    if (base === 'GBP' || (base === 'EUR' && calls === 2)) { res.writeHead(503); res.end(); }
-    else { res.setHeader('content-type','application/json'); res.end(JSON.stringify({rates:{BRL:5},date:'2026-09-14'})); }
+const { createApp } = require('../dist/app');
+const { loadConfig } = require('../dist/config');
+const { QueueWorker } = require('../dist/queue/queue.worker');
+const { payload, rateBody } = require('./helpers.cjs');
+
+async function api(t, options = {}) {
+  const app = await createApp({
+    config: { ...loadConfig({}), database: ':memory:', poll: 5 },
+    workerEnabled: false,
+    logger: false,
+    httpFetch: async () => Response.json(rateBody),
+    ...options,
   });
-  await new Promise(resolve => external.listen(0,'127.0.0.1',resolve));
-  Object.assign(process.env,{DATABASE_PATH:join(dir,'orders.sqlite'), EXCHANGE_API_URL:`http://127.0.0.1:${external.address().port}/rates`, POLL_MS:'10', RETRY_BASE_MS:'20', HTTP_TIMEOUT_MS:'500'});
-  const {createApp} = require('../dist/main');
-  let app;
-  try {
-    app = await createApp(); await app.listen(0,'127.0.0.1');
-    let base = await app.getUrl();
-    const request = async (path,body) => {
-      const response = await fetch(base+path, body === undefined ? {} : {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
-      return {status:response.status,body:await response.json()};
-    };
-    const payload = (key,currency='USD') => ({order_id:key,idempotency_key:key,customer:{email:'user@example.com',name:'Ana'},items:[{sku:'ABC',qty:2,unit_price:59.9}],currency});
-    async function waitFor(id,status) {
-      const deadline = Date.now()+5000;
-      while (Date.now()<deadline) {
-        const response = await request('/orders/'+id);
-        if (response.body.status===status) return response.body;
-        await new Promise(resolve=>setTimeout(resolve,15));
-      }
-      throw new Error('Timed out waiting for '+status);
-    }
-    assert.equal((await request('/webhooks/orders',{})).status,400);
-    assert.equal((await request('/webhooks/orders',{...payload('bad'),items:[{sku:'A',qty:-1,unit_price:2}]})).status,400);
-    const results = await Promise.all(Array.from({length:8},()=>request('/webhooks/orders',payload('one'))));
-    assert.ok(results.every(r=>r.status===202));
-    assert.equal(new Set(results.map(r=>r.body.id)).size,1);
-    assert.equal(results.filter(r=>!r.body.duplicate).length,1);
-    const id = results[0].body.id;
-    const done = await waitFor(id,'COMPLETED');
-    assert.equal(done.enrichment.converted_total,599);
-    assert.equal(done.total,119.8); assert.equal(calls,1);
-    assert.equal((await request('/webhooks/orders',{...payload('one'),currency:'EUR'})).status,409);
-    const retry = await request('/webhooks/orders',payload('retry','EUR'));
-    assert.equal((await waitFor(retry.body.id,'COMPLETED')).attempts,2);
-    const fail = await request('/webhooks/orders',payload('fail','GBP'));
-    const failed = await waitFor(fail.body.id,'FAILED_ENRICHMENT');
-    assert.equal(failed.attempts,3); assert.equal(failed.queue_state,'DLQ');
-    assert.equal((await request('/orders?status=FAILED_ENRICHMENT')).body.length,1);
-    assert.equal((await request('/orders?status=invalid')).status,400);
-    assert.equal((await request('/orders/missing')).status,404);
-    assert.deepEqual((await request('/queue/metrics')).body.counts,{WAITING:0,ACTIVE:0,RETRY:0,COMPLETED:2,DLQ:1});
-    await app.close(); app = undefined;
-    // Simulate a process dying after claiming a persisted job.
-    const {DatabaseSync} = require('node:sqlite');
-    const db = new DatabaseSync(process.env.DATABASE_PATH);
-    db.prepare("UPDATE orders SET status='PROCESSING', job_state='ACTIVE', attempts=1, lease_until=0 WHERE id=?").run(id);
-    db.close();
-    app = await createApp(); await app.listen(0,'127.0.0.1'); base = await app.getUrl();
-    assert.equal((await waitFor(id,'COMPLETED')).attempts,2);
-    assert.equal((await request('/webhooks/orders',payload('one'))).body.duplicate,true);
-    assert.equal((await request('/queue/metrics')).body.total,3);
-  } finally {
-    if(app) await app.close();
-    await new Promise(resolve=>external.close(resolve));
-    rmSync(dir,{recursive:true,force:true});
+  await app.listen(0, '127.0.0.1');
+  t.after(() => app.close());
+  const base = await app.getUrl();
+  async function request(path, body) {
+    const response = await fetch(
+      base + path,
+      body === undefined
+        ? {}
+        : {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+          },
+    );
+    return { status: response.status, body: await response.json() };
   }
+  return { app, base, request };
+}
+
+test('HTTP route contract: health, receipt, processing, detail, filtering and metrics', async (t) => {
+  const { app, request } = await api(t);
+  assert.equal((await request('/health')).body.status, 'ok');
+  assert.ok((await request('/')).body.endpoints.includes('GET /orders'));
+  const created = await request('/webhooks/orders', payload());
+  assert.equal(created.status, 202);
+  assert.equal(created.body.status, 'RECEIVED');
+  await app.get(QueueWorker).processNext();
+  const detail = await request('/orders/' + created.body.id);
+  assert.equal(detail.body.status, 'COMPLETED');
+  assert.equal(detail.body.enrichment.converted_total, 599);
+  assert.equal((await request('/orders?status=COMPLETED&limit=1&offset=0')).body.length, 1);
+  assert.equal((await request('/orders?status=RECEIVED')).body.length, 0);
+  assert.equal((await request('/queue/metrics')).body.counts.COMPLETED, 1);
+  assert.equal((await request('/orders/missing')).status, 404);
+});
+
+test('parallel webhook requests create only one durable order', async (t) => {
+  const { request } = await api(t);
+  const responses = await Promise.all(
+    Array.from({ length: 20 }, () => request('/webhooks/orders', payload())),
+  );
+  assert.ok(responses.every((r) => r.status === 202));
+  assert.equal(new Set(responses.map((r) => r.body.id)).size, 1);
+  assert.equal(responses.filter((r) => !r.body.duplicate).length, 1);
+  assert.equal((await request('/queue/metrics')).body.total, 1);
+  assert.equal((await request('/webhooks/orders', { ...payload(), currency: 'EUR' })).status, 409);
+});
+
+test('HTTP rejects malformed bodies and ambiguous query parameters', async (t) => {
+  const { request, base } = await api(t);
+  for (const body of [{}, null, [], { ...payload(), extra: true }])
+    assert.equal((await request('/webhooks/orders', body)).status, 400);
+  for (const query of [
+    'limit=1&limit=2',
+    'status=COMPLETED&status=RECEIVED',
+    'limit=101',
+    'offset=-1',
+    'status=bad',
+  ]) {
+    assert.equal((await request('/orders?' + query)).status, 400);
+  }
+  const malformed = await fetch(base + '/webhooks/orders', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{broken',
+  });
+  assert.equal(malformed.status, 400);
+  const large = await fetch(base + '/webhooks/orders', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ large: 'a'.repeat(110000) }),
+  });
+  assert.equal(large.status, 413);
+});
+
+test('two app instances have isolated injected configuration and databases', async (t) => {
+  const first = await api(t);
+  const second = await api(t);
+  await first.request('/webhooks/orders', payload());
+  assert.equal((await first.request('/queue/metrics')).body.total, 1);
+  assert.equal((await second.request('/queue/metrics')).body.total, 0);
+});
+
+test('automatic background processing reaches completion over HTTP', async (t) => {
+  const { request } = await api(t, { workerEnabled: true });
+  const created = await request('/webhooks/orders', payload());
+  const deadline = Date.now() + 3000;
+  let state;
+  while (Date.now() < deadline) {
+    state = (await request('/orders/' + created.body.id)).body.status;
+    if (state === 'COMPLETED') break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(state, 'COMPLETED');
 });
